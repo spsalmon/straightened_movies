@@ -269,10 +269,17 @@ wrote it, so existing experiments' files are picked up — but is never merged i
 the filemap and never referenced by the pipeline.
 
 On start, unless `--recompute_orientations` is set, the cache is read and a point
-is considered covered when every kept row for that point has an entry. Only
-uncovered points are predicted; results are merged with the cached rows and the
-file is rewritten. This is what makes re-runs with a different `--alignment` or a
-different `--movie_columns` cheap, since prediction dominates the runtime.
+is considered covered when it appears in it at all. Only uncovered points are
+predicted; results are merged with the cached rows and the file is rewritten.
+This is what makes re-runs with a different `--alignment` or a different
+`--movie_columns` cheap, since prediction dominates the runtime.
+
+Coverage is per point rather than per row on purpose. A point whose series
+contains a permanently unreadable frame has fewer cached rows than the filemap
+has for it, and requiring every row to be present would re-predict that point on
+every run without ever converging. The cost is that timepoints added to an
+experiment after a run are not picked up for a point already in the cache;
+`--recompute_orientations` is the answer there.
 
 ## Error handling
 
