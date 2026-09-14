@@ -20,7 +20,6 @@ sys.path.insert(0, REPO_ROOT)
 
 import straightened_movies as sm  # noqa: E402
 
-
 # ---- Frame placement geometry ----
 
 
@@ -419,3 +418,203 @@ def test_build_movie_promotes_single_channel_frames():
 def test_build_movie_rejects_an_unknown_alignment():
     with pytest.raises(ValueError, match="alignment must be one of"):
         sm.build_movie(_growing_series([10]), np.zeros((1, 2), dtype=int), "diagonal")
+
+
+# ---- Block plumbing ----
+
+
+def test_parse_points_accepts_numbers_and_ranges():
+    assert sm.parse_points(["All"]) is None
+    assert sm.parse_points(["3", "10-12", "42"]) == {3, 10, 11, 12, 42}
+
+
+def test_parse_points_rejects_a_malformed_range():
+    with pytest.raises(ValueError, match="Could not parse"):
+        sm.parse_points(["1-2-3"])
+
+
+def test_resolve_movie_columns_finds_straightened_columns():
+    import polars as pl
+
+    filemap = pl.DataFrame(
+        {
+            "Time": [0],
+            "Point": [1],
+            "analysis/ch1_raw_str": ["a.tiff"],
+            "analysis/ch2_seg_str": ["b.tiff"],
+            "ch2_seg_str_volume": [1.0],
+        }
+    )
+
+    assert sm.resolve_movie_columns(["All"], filemap) == [
+        "analysis/ch1_raw_str",
+        "analysis/ch2_seg_str",
+    ]
+    assert sm.resolve_movie_columns(["analysis/ch1_raw_str"], filemap) == [
+        "analysis/ch1_raw_str"
+    ]
+
+
+def test_resolve_movie_columns_rejects_a_missing_column():
+    import polars as pl
+
+    filemap = pl.DataFrame({"Time": [0], "Point": [1]})
+
+    with pytest.raises(ValueError, match="not in the filemap"):
+        sm.resolve_movie_columns(["analysis/nope_str"], filemap)
+
+
+def test_read_straightened_image_returns_none_for_an_unreadable_file(tmp_path):
+    broken = tmp_path / "broken.tiff"
+    broken.write_bytes(b"not a tiff")
+
+    assert sm.read_straightened_image(str(broken), 0) is None
+
+
+@pytest.fixture
+def synthetic_experiment(tmp_path):
+    """A tiny two-point experiment: filemap, straightened images, and an atlas."""
+    import polars as pl
+    import tifffile
+
+    experiment = tmp_path / "experiment"
+    straightened = experiment / "analysis" / "ch1_raw_str"
+    report = experiment / "analysis" / "report"
+    atlas_dir = tmp_path / "atlas"
+    for directory in (straightened, report, atlas_dir):
+        directory.mkdir(parents=True)
+
+    rows = []
+    for point in (1, 2):
+        for time, length in enumerate(range(30, 54, 4)):
+            # Two channels; channel 1 carries the orientable structure. Point 2 is
+            # imaged facing the other way.
+            worm = _worm(length, flip=1 if point == 2 else None)
+            image = np.stack([np.zeros_like(worm), worm])
+            image = (image * 10_000).astype(np.uint16)
+            path = straightened / f"Time{time:06d}_Point{point:06d}_str.tiff"
+            tifffile.imwrite(str(path), image, photometric="minisblack")
+            rows.append(
+                {
+                    "Time": time,
+                    "Point": point,
+                    "analysis/ch1_raw_str": str(path),
+                    "ch1_seg_str_qc": "worm",
+                }
+            )
+
+    filemap_path = report / "analysis_filemap.csv"
+    pl.DataFrame(rows).write_csv(str(filemap_path))
+
+    atlas_rows = []
+    for length in (30, 40, 50, 60):
+        worm = _worm(length)
+        image = np.stack([np.zeros_like(worm), worm])
+        image = (image * 10_000).astype(np.uint16)
+        path = atlas_dir / f"atlas_{length}.tiff"
+        tifffile.imwrite(str(path), image, photometric="minisblack")
+        atlas_rows.append({"atlas_image": str(path)})
+
+    atlas_csv = atlas_dir / "atlas.csv"
+    pl.DataFrame(atlas_rows).write_csv(str(atlas_csv))
+
+    return {
+        "experiment": experiment,
+        "filemap": filemap_path,
+        "atlas": atlas_csv,
+        "report": report,
+    }
+
+
+def _run_script(experiment, extra=()):
+    import subprocess
+
+    return subprocess.run(
+        [
+            sys.executable,
+            os.path.join(REPO_ROOT, "straightened_movies.py"),
+            "--filemap",
+            str(experiment["filemap"]),
+            "--straightened_column",
+            "analysis/ch1_raw_str",
+            "--orientation_channel",
+            "1",
+            "--qc_column",
+            "ch1_seg_str_qc",
+            "--atlas",
+            str(experiment["atlas"]),
+            "--atlas_channel",
+            "1",
+            "--n_jobs",
+            "1",
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+
+
+def test_end_to_end_writes_movies_and_a_cache(synthetic_experiment):
+    import polars as pl
+
+    result = _run_script(synthetic_experiment, ["--alignment", "left"])
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    movies = synthetic_experiment["experiment"] / "movies" / "ch1_raw_str_movies"
+    assert sorted(path.name for path in movies.iterdir()) == [
+        "Point0001_movie.tiff",
+        "Point0002_movie.tiff",
+    ]
+
+    cache = pl.read_csv(str(synthetic_experiment["report"] / "orientations.csv"))
+    assert cache.columns == [
+        "Time",
+        "Point",
+        "head",
+        "vulva",
+        "head_confidence",
+        "shift_ax0",
+        "shift_ax1",
+    ]
+    assert cache.height == 12
+    # Point 2 was imaged facing the other way, so the two points get opposite labels.
+    heads = {
+        point: set(cache.filter(pl.col("Point") == point)["head"].to_list())
+        for point in (1, 2)
+    }
+    assert heads[1] != heads[2]
+
+
+def test_end_to_end_leaves_the_filemap_untouched(synthetic_experiment):
+    before = synthetic_experiment["filemap"].read_text()
+
+    _run_script(synthetic_experiment)
+
+    assert synthetic_experiment["filemap"].read_text() == before
+
+
+def test_end_to_end_reuses_the_cache_on_a_second_run(synthetic_experiment):
+    import tifffile
+
+    _run_script(synthetic_experiment, ["--alignment", "center"])
+    cache_path = synthetic_experiment["report"] / "orientations.csv"
+    cached = cache_path.read_text()
+
+    movies = synthetic_experiment["experiment"] / "movies" / "ch1_raw_str_movies"
+    centered = tifffile.imread(str(movies / "Point0001_movie.tiff"))
+
+    result = _run_script(synthetic_experiment, ["--alignment", "left"])
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # The orientations are reused verbatim, but the movie is re-assembled with the
+    # new alignment. Which alignment gives the wider canvas depends on whether the
+    # registration shifts are jitter or track growth, so only the fact that the
+    # movie changed is asserted here; the head-pinning itself is covered by
+    # test_build_movie_left_keeps_the_head_end_stationary.
+    assert cache_path.read_text() == cached
+    assert "Reusing cached orientations" in result.stdout
+    assert "Predicting orientations" not in result.stdout
+    left = tifffile.imread(str(movies / "Point0001_movie.tiff"))
+    assert left.shape != centered.shape or not np.array_equal(left, centered)

@@ -10,15 +10,27 @@ the orientation table under ``--orientations``, the latter purely as a cache tha
 makes re-runs over the same experiment cheap.
 """
 
+import argparse
+import os
+import pickle
+import time
+import traceback
 from itertools import compress
 from itertools import product
 
 import numpy as np
+import polars as pl
+from joblib import Parallel
+from joblib import delayed
 from skimage import exposure
 from skimage import metrics
 from skimage import registration
 from skimage import transform as sk_transform
+from tifffile import imwrite
+from towbintools.foundation.file_handling import read_filemap
+from towbintools.foundation.file_handling import write_filemap
 from towbintools.foundation.image_handling import pad_to_dim_equally
+from towbintools.foundation.image_handling import read_tiff_file
 
 # ---------------------------------------------------------------------------
 # Generic helpers -- candidates for towbintools
@@ -309,7 +321,9 @@ class FlipTransform:
         return hash(self.mirror_axes)
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, FlipTransform) and self.mirror_axes == other.mirror_axes
+        return (
+            isinstance(other, FlipTransform) and self.mirror_axes == other.mirror_axes
+        )
 
     def __contains__(self, axis: int) -> bool:
         return axis in self.mirror_axes
@@ -545,7 +559,9 @@ def running_mean_orientation(
     oriented = [seed] * window
     shifts = [np.zeros(2, dtype=int)] * window
     for image in images:
-        reference = mean_registered_image(oriented[-window:], np.array(shifts[-window:]))
+        reference = mean_registered_image(
+            oriented[-window:], np.array(shifts[-window:])
+        )
         scale = min(_registration_scale(reference), _registration_scale(image))
         transform, shift, _ = estimate_flip_transform(
             reference, image, channel_axis=channel_axis, scale=scale
@@ -701,5 +717,422 @@ def build_movie(
         )
     frames = [image[np.newaxis, ...] if image.ndim == 2 else image for image in images]
     shapes = np.array([frame.shape[-2:] for frame in frames])
-    origins, canvas = registration_origins(shapes, shifts, anchors=ALIGNMENTS[alignment])
+    origins, canvas = registration_origins(
+        shapes, shifts, anchors=ALIGNMENTS[alignment]
+    )
     return assemble_registered_stack(frames, origins, canvas)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline block
+# ---------------------------------------------------------------------------
+
+# Quality-control label marking an image as a usable worm.
+DEFAULT_QC_VALUE = "worm"
+# Columns of the orientation cache, in order.
+ORIENTATION_COLUMNS = [
+    "Time",
+    "Point",
+    "head",
+    "vulva",
+    "head_confidence",
+    "shift_ax0",
+    "shift_ax1",
+]
+
+
+def load_filemap(path: str) -> pl.DataFrame:
+    """
+    Read a filemap from either a pickled DataFrame or a filemap file.
+
+    The pipeline hands its workers a pickle; a manual run points at the experiment's
+    own ``.csv`` or ``.parquet``.
+
+    Parameters:
+        path (str): Path to a ``.pkl``, ``.csv`` or ``.parquet`` file.
+
+    Returns:
+        pl.DataFrame: The filemap.
+    """
+    if path.endswith(".pkl"):
+        with open(path, "rb") as handle:
+            return pl.DataFrame(pickle.load(handle))
+    return read_filemap(path)
+
+
+def load_config(path: str | None) -> dict:
+    if path is None or path == "None":
+        return {}
+    if path.endswith(".pkl"):
+        with open(path, "rb") as handle:
+            return pickle.load(handle)
+
+    import yaml
+
+    with open(path) as handle:
+        return yaml.safe_load(handle)
+
+
+def read_straightened_image(path: str, channel: int) -> np.ndarray | None:
+    """
+    Read one channel of a straightened image, or ``None`` if it cannot be read.
+
+    A small fraction of straightened images are written out malformed, and asking
+    for a channel they do not have raises. Returning ``None`` lets the caller drop
+    that frame instead of losing the whole point to it.
+
+    Parameters:
+        path (str): Path to the image.
+        channel (int): Channel index within the image.
+
+    Returns:
+        np.ndarray | None: The channel as a 2D array, or ``None``.
+    """
+    try:
+        image = read_tiff_file(path, channels_to_keep=[channel])
+    except Exception as error:
+        print(f"Could not read {path}: {error}")
+        return None
+    if image.ndim != 2:
+        print(f"Unexpected shape {image.shape} for channel {channel} of {path}")
+        return None
+    return image
+
+
+def load_atlas(path: str, channel: int) -> list[np.ndarray]:
+    """
+    Read the atlas images listed in an atlas CSV.
+
+    Parameters:
+        path (str): Path to a CSV with an ``atlas_image`` column.
+        channel (int): Channel index within the atlas images, which must be the same
+            kind of microscopy as the images being oriented.
+
+    Returns:
+        list[np.ndarray]: The atlas images, normalised against a shared range.
+
+    Raises:
+        ValueError: If no atlas image could be read.
+    """
+    listing = read_filemap(path)
+    images = [
+        image
+        for image in (
+            read_straightened_image(row, channel)
+            for row in listing["atlas_image"].to_list()
+        )
+        if image is not None
+    ]
+    if not images:
+        raise ValueError(f"No readable atlas images listed in {path}")
+    return normalize_images_to_common_range(images)
+
+
+def parse_points(values: list[str]) -> set[int] | None:
+    """
+    Parse a point selection into the set of points to process.
+
+    Parameters:
+        values (list[str]): ``["All"]``, or point numbers and inclusive ranges such
+            as ``["3", "10-20", "42"]``.
+
+    Returns:
+        set[int] | None: The selected points, or ``None`` for all of them.
+
+    Raises:
+        ValueError: If an entry is neither a number nor a range.
+    """
+    if len(values) == 1 and values[0] == "All":
+        return None
+
+    points = set()
+    for value in values:
+        try:
+            if "-" in value:
+                first, last = value.split("-")
+                points.update(range(int(first), int(last) + 1))
+            else:
+                points.add(int(value))
+        except ValueError:
+            raise ValueError(f"Could not parse {value!r} as a point number or range")
+    return points
+
+
+def resolve_movie_columns(requested: list[str], filemap: pl.DataFrame) -> list[str]:
+    """
+    Work out which filemap columns to build movies from.
+
+    Parameters:
+        requested (list[str]): ``["All"]`` for every column of straightened images,
+            or an explicit list of column names.
+        filemap (pl.DataFrame): The experiment filemap.
+
+    Returns:
+        list[str]: The columns to process.
+
+    Raises:
+        ValueError: If a requested column is not in the filemap, or if ``All``
+            matched nothing.
+    """
+    if len(requested) == 1 and requested[0] == "All":
+        columns = [column for column in filemap.columns if column.endswith("_str")]
+        if not columns:
+            raise ValueError("No column ending in '_str' found in the filemap")
+        return columns
+
+    missing = [column for column in requested if column not in filemap.columns]
+    if missing:
+        raise ValueError(f"Requested columns not in the filemap: {missing}")
+    return requested
+
+
+def predict_point_orientations(
+    point: int,
+    times: list[int],
+    paths: list[str],
+    atlas: list[np.ndarray],
+    channel: int,
+) -> list[dict]:
+    """
+    Predict orientations and registration shifts for one point.
+
+    Parameters:
+        point (int): The point being processed.
+        times (list[int]): Timepoints, in order, matching ``paths``.
+        paths (list[str]): Straightened image paths, in time order.
+        atlas (list[np.ndarray]): Manually oriented reference images.
+        channel (int): Channel index used to predict orientation.
+
+    Returns:
+        list[dict]: One record per readable image, with the orientation-cache
+            columns. Empty if the point could not be processed.
+    """
+    try:
+        images = [read_straightened_image(path, channel) for path in paths]
+        readable = [image is not None for image in images]
+        if not all(readable):
+            print(
+                f"Point {point}: skipped {readable.count(False)}/{len(readable)} "
+                "images that could not be read"
+            )
+        times = [t for t, keep in zip(times, readable) if keep]
+        images = [image for image in images if image is not None]
+        if not images:
+            raise ValueError(f"No readable images for point {point}")
+
+        shifts, orientations, confidence = predict_orientations(images, atlas)
+
+        return [
+            {
+                "Time": t,
+                "Point": point,
+                "head": orientation["head"],
+                "vulva": orientation["vulva"],
+                "head_confidence": confidence,
+                "shift_ax0": int(shift[0]),
+                "shift_ax1": int(shift[1]),
+            }
+            for t, orientation, shift in zip(times, orientations, shifts)
+        ]
+    except Exception:
+        print(f"Error predicting orientations for point {point}")
+        print(traceback.format_exc())
+        return []
+
+
+def write_point_movies(
+    point: int,
+    rows: pl.DataFrame,
+    columns: list[str],
+    movie_dir: str,
+    alignment: str,
+    max_frames: int | None,
+) -> None:
+    """
+    Assemble and write one point's movies, one per column of straightened images.
+
+    Parameters:
+        point (int): The point being processed.
+        rows (pl.DataFrame): That point's rows, in time order, carrying the image
+            paths and the ``head`` / ``vulva`` / ``shift_ax0`` / ``shift_ax1``
+            columns.
+        columns (list[str]): Filemap columns to build movies from.
+        movie_dir (str): Directory the per-column movie directories are created in.
+        alignment (str): ``"center"`` or ``"left"``.
+        max_frames (int | None): Cap on the number of frames, or ``None`` for all.
+    """
+    if max_frames is not None:
+        rows = rows.head(max_frames)
+
+    orientations = rows.select(["head", "vulva"]).to_dicts()
+    shifts = rows.select(["shift_ax0", "shift_ax1"]).to_numpy().astype(int)
+
+    for column in columns:
+        output_dir = os.path.join(movie_dir, f"{os.path.basename(column)}_movies")
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            images = [read_tiff_file(path) for path in rows[column].to_list()]
+            movie = build_movie(
+                orient_images(images, orientations), shifts, alignment=alignment
+            )
+            imwrite(
+                os.path.join(output_dir, f"Point{point:04}_movie.tiff"),
+                movie,
+                compression="zlib",
+                imagej=True,
+                metadata={"axes": "TCYX"},
+            )
+        except Exception:
+            print(f"Error building the {column} movie for point {point}")
+            print(traceback.format_exc())
+
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    # The pipeline's custom-block contract. --block_config and --output are accepted
+    # so that the generated command line is satisfied; this block writes neither a
+    # report nor a directory the filemap knows about.
+    parser.add_argument("-f", "--filemap", required=True)
+    parser.add_argument("-c", "--config", default=None)
+    parser.add_argument("-b", "--block_config", default=None)
+    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("-j", "--n_jobs", type=int, default=None)
+
+    parser.add_argument("--straightened_column", required=True)
+    parser.add_argument("--orientation_channel", type=int, default=0)
+    parser.add_argument("--atlas", default=None)
+    parser.add_argument("--atlas_channel", type=int, default=0)
+    parser.add_argument("--qc_column", default=None)
+    parser.add_argument("--qc_value", default=DEFAULT_QC_VALUE)
+    parser.add_argument("--movie_columns", nargs="+", default=["All"])
+    parser.add_argument("--movie_dir", default=None)
+    parser.add_argument("--orientations", default=None)
+    parser.add_argument("--recompute_orientations", action="store_true")
+    parser.add_argument("--alignment", choices=sorted(ALIGNMENTS), default="center")
+    parser.add_argument("--points", nargs="+", default=["All"])
+    parser.add_argument("--max_frames", type=int, default=None)
+    return parser.parse_args()
+
+
+def _resolve_directories(args: argparse.Namespace, config: dict) -> tuple[str, str]:
+    # The pipeline config carries the experiment layout. Without it, fall back to
+    # the filemap's own location: <experiment>/<analysis>/report/filemap.csv.
+    report_dir = config.get("report_subdir")
+    experiment_dir = config.get("experiment_dir")
+    if report_dir is None:
+        report_dir = os.path.dirname(os.path.abspath(args.filemap))
+    if experiment_dir is None:
+        experiment_dir = os.path.dirname(os.path.dirname(report_dir))
+
+    movie_dir = args.movie_dir or os.path.join(experiment_dir, "movies")
+    orientations = args.orientations or os.path.join(report_dir, "orientations.csv")
+    return movie_dir, orientations
+
+
+def main() -> None:
+    args = get_args()
+    config = load_config(args.config)
+    n_jobs = (
+        args.n_jobs
+        or config.get("n_jobs")
+        or int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+    )
+    movie_dir, orientations_path = _resolve_directories(args, config)
+
+    filemap = load_filemap(args.filemap)
+    if args.straightened_column not in filemap.columns:
+        raise ValueError(
+            f"Column {args.straightened_column!r} is not in the filemap. "
+            f"Available columns: {filemap.columns}"
+        )
+
+    movie_columns = resolve_movie_columns(args.movie_columns, filemap)
+    rows = filemap.select(
+        list(
+            dict.fromkeys(
+                ["Time", "Point", args.straightened_column]
+                + movie_columns
+                + ([args.qc_column] if args.qc_column else [])
+            )
+        )
+    )
+    if args.qc_column:
+        rows = rows.filter(pl.col(args.qc_column) == args.qc_value)
+    selected = parse_points(args.points)
+    if selected is not None:
+        rows = rows.filter(pl.col("Point").is_in(sorted(selected)))
+    rows = rows.sort(["Point", "Time"])
+    if rows.height == 0:
+        raise ValueError("No images left to process after filtering")
+
+    points = rows["Point"].unique().sort().to_list()
+    print(f"{time.asctime()} - Processing {len(points)} points: {points}")
+
+    cached = None
+    covered: set[int] = set()
+    if not args.recompute_orientations and os.path.exists(orientations_path):
+        cached = read_filemap(orientations_path).select(ORIENTATION_COLUMNS)
+        covered = set(cached["Point"].unique().to_list())
+        print(f"Reusing cached orientations from {orientations_path}")
+
+    missing = [point for point in points if point not in covered]
+    if missing:
+        if args.atlas is None:
+            raise ValueError(
+                f"--atlas is required: {len(missing)} points are not in the cache"
+            )
+        atlas = load_atlas(args.atlas, args.atlas_channel)
+        started = time.time()
+        print(f"{time.asctime()} - Predicting orientations for {len(missing)} points")
+        records = Parallel(n_jobs=n_jobs)(
+            delayed(predict_point_orientations)(
+                point,
+                rows.filter(pl.col("Point") == point)["Time"].to_list(),
+                rows.filter(pl.col("Point") == point)[
+                    args.straightened_column
+                ].to_list(),
+                atlas,
+                args.orientation_channel,
+            )
+            for point in missing
+        )
+        predicted = pl.DataFrame(
+            [record for point_records in records for record in point_records],
+            schema=ORIENTATION_COLUMNS,
+        )
+        cached = (
+            predicted
+            if cached is None
+            else pl.concat([cached, predicted]).unique(
+                subset=["Time", "Point"], keep="last"
+            )
+        )
+        cached = cached.sort(["Point", "Time"])
+        os.makedirs(os.path.dirname(orientations_path), exist_ok=True)
+        write_filemap(cached, orientations_path)
+        print(
+            f"{time.asctime()} - Orientations written to {orientations_path} "
+            f"({round((time.time() - started) / 60)}min)"
+        )
+
+    movie_rows = rows.join(cached, on=["Time", "Point"], how="inner").sort(
+        ["Point", "Time"]
+    )
+    started = time.time()
+    print(f"{time.asctime()} - Building {args.alignment}-aligned movies in {movie_dir}")
+    Parallel(n_jobs=n_jobs)(
+        delayed(write_point_movies)(
+            point,
+            movie_rows.filter(pl.col("Point") == point),
+            movie_columns,
+            movie_dir,
+            args.alignment,
+            args.max_frames,
+        )
+        for point in points
+    )
+    print(f"{time.asctime()} - Finished ({round((time.time() - started) / 60)}min)")
+
+
+if __name__ == "__main__":
+    main()
