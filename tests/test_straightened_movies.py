@@ -341,3 +341,81 @@ def test_predict_orientations_labels_an_unflipped_series():
 
     assert all(orientation["head"] == "L" for orientation in orientations)
     assert confidence == pytest.approx(1.0)
+
+
+# ---- Movie assembly ----
+
+
+def test_orient_images_flips_by_label():
+    image = np.array([[1, 2], [3, 4]])
+    orientations = [
+        {"head": "L", "vulva": "U"},
+        {"head": "R", "vulva": "U"},
+        {"head": "L", "vulva": "D"},
+    ]
+
+    oriented = sm.orient_images([image, image, image], orientations)
+
+    assert np.array_equal(oriented[0], image)
+    assert np.array_equal(oriented[1], np.array([[2, 1], [4, 3]]))
+    assert np.array_equal(oriented[2], np.array([[3, 4], [1, 2]]))
+
+
+def _growing_series(lengths, height=10):
+    # Frames of growing length, each filled with a constant so the occupied
+    # region of the canvas is easy to find.
+    return [np.ones((height, length), dtype=np.uint16) for length in lengths]
+
+
+def test_build_movie_left_keeps_the_head_end_stationary():
+    images = _growing_series([10, 20, 30, 40])
+    shifts = np.zeros((4, 2), dtype=int)
+
+    movie = sm.build_movie(images, shifts, alignment="left")
+
+    assert movie.shape == (4, 1, 10, 40)
+    # Every frame starts at the same column, so growth is entirely rightwards.
+    starts = [int(np.flatnonzero(frame[0].any(axis=0))[0]) for frame in movie]
+    assert starts == [0, 0, 0, 0]
+
+
+def test_build_movie_center_spreads_growth_both_ways():
+    images = _growing_series([10, 20, 30, 40])
+    shifts = np.zeros((4, 2), dtype=int)
+
+    movie = sm.build_movie(images, shifts, alignment="center")
+
+    starts = [int(np.flatnonzero(frame[0].any(axis=0))[0]) for frame in movie]
+    ends = [int(np.flatnonzero(frame[0].any(axis=0))[-1]) for frame in movie]
+    # The head end moves left as the worm grows, and the tail end moves right.
+    assert starts == sorted(starts, reverse=True)
+    assert starts[0] > starts[-1]
+    assert ends == sorted(ends)
+
+
+def test_build_movie_preserves_registration_under_both_alignments():
+    images = _growing_series([20, 20, 20, 20])
+    shifts = np.array([[0, 0], [0, 4], [0, -3], [0, 7]])
+
+    left = sm.build_movie(images, shifts, alignment="left")
+    centered = sm.build_movie(images, shifts, alignment="center")
+
+    def starts(movie):
+        return [int(np.flatnonzero(frame[0].any(axis=0))[0]) for frame in movie]
+
+    # Alignment shifts every frame by a constant; the spacing between frames,
+    # which is what removes the jitter, is identical either way.
+    assert np.array_equal(np.diff(starts(left)), np.diff(starts(centered)))
+    assert np.array_equal(np.diff(starts(left)), np.diff(shifts[:, 1]))
+
+
+def test_build_movie_promotes_single_channel_frames():
+    movie = sm.build_movie(_growing_series([10, 12]), np.zeros((2, 2), dtype=int))
+
+    assert movie.ndim == 4
+    assert movie.shape[1] == 1
+
+
+def test_build_movie_rejects_an_unknown_alignment():
+    with pytest.raises(ValueError, match="alignment must be one of"):
+        sm.build_movie(_growing_series([10]), np.zeros((1, 2), dtype=int), "diagonal")

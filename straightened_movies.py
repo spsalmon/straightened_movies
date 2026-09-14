@@ -637,3 +637,69 @@ def predict_orientations(
         (transform + consensus).orientation_labels() for transform in transforms
     ]
     return shifts, orientations, confidence
+
+
+# ---------------------------------------------------------------------------
+# Movie assembly
+# ---------------------------------------------------------------------------
+
+
+def orient_images(
+    images: list[np.ndarray],
+    orientations: list[dict[str, str]],
+) -> list[np.ndarray]:
+    """
+    Flip each image so that the worm faces head left and vulva up.
+
+    Parameters:
+        images (list[np.ndarray]): Images of shape ``(..., H, W)``.
+        orientations (list[dict[str, str]]): The ``head`` and ``vulva`` label of each
+            image, as returned by ``predict_orientations``.
+
+    Returns:
+        list[np.ndarray]: The flipped images.
+    """
+    oriented = []
+    for image, orientation in zip(images, orientations):
+        if orientation["head"] == "R":
+            image = np.flip(image, axis=-1)
+        if orientation["vulva"] == "D":
+            image = np.flip(image, axis=-2)
+        oriented.append(image)
+    return oriented
+
+
+def build_movie(
+    images: list[np.ndarray],
+    shifts: np.ndarray,
+    alignment: str = "center",
+) -> np.ndarray:
+    """
+    Assemble registered frames into a movie.
+
+    The frames are placed on a shared canvas by their registration shifts, which
+    removes the jitter between consecutive timepoints, and anchored according to
+    ``alignment``. Frames must already face head left and vulva up.
+
+    Parameters:
+        images (list[np.ndarray]): Frames of shape ``(C, H, W)`` or ``(H, W)``, in
+            time order.
+        shifts (np.ndarray): Registration shift of each frame, of shape ``(N, 2)``.
+        alignment (str): ``"center"`` to let the worm grow in both directions, or
+            ``"left"`` to anchor the head end so that it only grows rightwards.
+            (default: "center")
+
+    Returns:
+        np.ndarray: The movie, of shape ``(T, C, H, W)``.
+
+    Raises:
+        ValueError: If ``alignment`` is not one of the known alignments.
+    """
+    if alignment not in ALIGNMENTS:
+        raise ValueError(
+            f"alignment must be one of {sorted(ALIGNMENTS)}, got {alignment!r}"
+        )
+    frames = [image[np.newaxis, ...] if image.ndim == 2 else image for image in images]
+    shapes = np.array([frame.shape[-2:] for frame in frames])
+    origins, canvas = registration_origins(shapes, shifts, anchors=ALIGNMENTS[alignment])
+    return assemble_registered_stack(frames, origins, canvas)
