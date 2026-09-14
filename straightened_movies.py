@@ -11,6 +11,10 @@ makes re-runs over the same experiment cheap.
 """
 
 import numpy as np
+from skimage import exposure
+from skimage import metrics
+from skimage import registration
+from towbintools.foundation.image_handling import pad_to_dim_equally
 
 # ---------------------------------------------------------------------------
 # Generic helpers -- candidates for towbintools
@@ -138,3 +142,137 @@ def crop_to_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     if rows.size == 0 or columns.size == 0:
         raise ValueError("Cannot crop to an empty mask")
     return image[..., rows[0] : rows[-1] + 1, columns[0] : columns[-1] + 1]
+
+
+def normalize_images_to_common_range(
+    images: list[np.ndarray],
+    out_range: str = "float32",
+) -> list[np.ndarray]:
+    """
+    Rescale a series of images against an intensity range shared by the whole series.
+
+    Every channel is rescaled from its minimum and maximum across all the images, so
+    that frames stay comparable to one another. ``image_handling.normalize_image``
+    rescales a single image and would give every frame a range of its own.
+
+    Parameters:
+        images (list[np.ndarray]): Images of shape ``(C, H, W)`` or ``(H, W)``, all
+            with the same number of channels.
+        out_range (str): Output range, passed to
+            ``skimage.exposure.rescale_intensity``. (default: "float32")
+
+    Returns:
+        list[np.ndarray]: The rescaled images, keeping the dimensionality of the input.
+    """
+    stacks = [image[np.newaxis, ...] if image.ndim == 2 else image for image in images]
+    channel_ranges = [
+        (
+            min(stack[channel].min() for stack in stacks),
+            max(stack[channel].max() for stack in stacks),
+        )
+        for channel in range(stacks[0].shape[0])
+    ]
+    return [
+        np.stack(
+            [
+                exposure.rescale_intensity(
+                    channel, in_range=channel_range, out_range=out_range
+                )
+                for channel, channel_range in zip(stack, channel_ranges)
+            ]
+        ).squeeze()
+        for stack in stacks
+    ]
+
+
+def structural_dissimilarity(
+    image: np.ndarray,
+    other: np.ndarray,
+    channel_axis: int | None = None,
+) -> float:
+    """
+    Measure how dissimilar two images of the same shape are, as ``1 - SSIM``.
+
+    The comparison window is 21 pixels rather than scikit-image's default of 7. The
+    longer range is more forgiving of large morphological differences and of slight
+    channel misalignment, which widens the dynamic range of the measure and makes two
+    candidate alignments easier to tell apart.
+
+    Parameters:
+        image (np.ndarray): First image, of shape ``(..., H, W)``.
+        other (np.ndarray): Second image, of the same shape.
+        channel_axis (int | None): Axis holding channels, or ``None`` for a
+            single-channel image. (default: None)
+
+    Returns:
+        float: The dissimilarity, ``0.0`` for identical images and larger the more
+            they differ.
+
+    Raises:
+        ValueError: If the two images do not have the same shape.
+    """
+    if image.shape != other.shape:
+        raise ValueError(
+            f"Images must have the same shape, got {image.shape} and {other.shape}"
+        )
+    window = min(21, *image.shape)
+    # structural_similarity requires an odd window.
+    window = window - ((window + 1) % 2)
+    data_range = max(image.max(), other.max()) - min(image.min(), other.min())
+    similarity = metrics.structural_similarity(
+        image,
+        other,
+        data_range=data_range,
+        win_size=window,
+        channel_axis=channel_axis,
+        gaussian_weights=False,
+        use_sample_covariance=False,
+    )
+    return 1 - similarity
+
+
+def estimate_translation(
+    reference: np.ndarray,
+    moving: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """
+    Find the translation that best registers one image onto another.
+
+    Both images are padded to the sum of their shapes so that the circular
+    convolution behind phase cross correlation cannot wrap one edge onto the other,
+    and the dissimilarity is measured over the region where they actually overlap.
+
+    Parameters:
+        reference (np.ndarray): The image being registered onto, of shape ``(H, W)``.
+        moving (np.ndarray): The image being moved, of shape ``(H, W)``.
+
+    Returns:
+        tuple[np.ndarray, float]: The integer shift applying ``moving`` onto
+            ``reference``, and the dissimilarity of the two once registered.
+    """
+    target = np.array(reference.shape) + np.array(moving.shape) - 1
+    reference_padded = pad_to_dim_equally(reference, *target)
+    reference_mask = pad_to_dim_equally(np.ones_like(reference, dtype=bool), *target)
+    moving_padded = pad_to_dim_equally(moving, *target)
+    moving_mask = pad_to_dim_equally(np.ones_like(moving, dtype=bool), *target)
+
+    # The masked variant always returns an integer shift, but types it as a float.
+    shift, _, _ = registration.phase_cross_correlation(
+        reference_image=reference_padded,
+        reference_mask=reference_mask,
+        moving_image=moving_padded,
+        moving_mask=moving_mask,
+        overlap_ratio=0.9,
+        normalization=None,
+    )
+    shift = shift.astype(int)
+
+    moving_padded = np.roll(moving_padded, shift, axis=(-2, -1))
+    moving_mask = np.roll(moving_mask, shift, axis=(-2, -1))
+
+    overlap = reference_mask & moving_mask
+    dissimilarity = structural_dissimilarity(
+        crop_to_mask(reference_padded, overlap),
+        crop_to_mask(moving_padded, overlap),
+    )
+    return shift, dissimilarity

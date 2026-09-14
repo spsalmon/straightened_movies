@@ -123,3 +123,76 @@ def test_crop_to_mask_returns_the_bounding_box():
 def test_crop_to_mask_rejects_an_empty_mask():
     with pytest.raises(ValueError, match="empty mask"):
         sm.crop_to_mask(np.zeros((4, 5)), np.zeros((4, 5), dtype=bool))
+
+
+# ---- Normalisation, similarity, translation ----
+
+
+def test_normalize_images_to_common_range_uses_one_range_for_the_series():
+    images = [
+        np.array([[0, 50]], dtype=np.uint16),
+        np.array([[50, 100]], dtype=np.uint16),
+    ]
+
+    normalized = sm.normalize_images_to_common_range(images)
+
+    # A shared range means the 50 in both images maps to the same value, which a
+    # per-image normalisation would not do.
+    assert normalized[0][1] == pytest.approx(normalized[1][0])
+    assert normalized[0][0] == pytest.approx(0.0)
+    assert normalized[1][1] == pytest.approx(1.0)
+
+
+def test_normalize_images_to_common_range_keeps_dimensionality():
+    two_d = [np.ones((4, 5), dtype=np.uint16), np.zeros((4, 5), dtype=np.uint16)]
+    three_d = [
+        np.ones((2, 4, 5), dtype=np.uint16),
+        np.zeros((2, 4, 5), dtype=np.uint16),
+    ]
+
+    assert sm.normalize_images_to_common_range(two_d)[0].shape == (4, 5)
+    assert sm.normalize_images_to_common_range(three_d)[0].shape == (2, 4, 5)
+
+
+def test_structural_dissimilarity_is_zero_for_identical_images():
+    rng = np.random.default_rng(0)
+    image = rng.random((40, 40)).astype(np.float32)
+
+    assert sm.structural_dissimilarity(image, image) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_structural_dissimilarity_grows_with_difference():
+    rng = np.random.default_rng(0)
+    image = rng.random((40, 40)).astype(np.float32)
+    slightly_off = image + rng.normal(0, 0.01, image.shape).astype(np.float32)
+    very_off = rng.random((40, 40)).astype(np.float32)
+
+    assert sm.structural_dissimilarity(
+        image, slightly_off
+    ) < sm.structural_dissimilarity(image, very_off)
+
+
+def test_structural_dissimilarity_rejects_mismatched_shapes():
+    with pytest.raises(ValueError, match="same shape"):
+        sm.structural_dissimilarity(np.zeros((4, 4)), np.zeros((4, 5)))
+
+
+def _blob(height=60, width=80, row=20, column=10):
+    # An asymmetric bright patch: wider than tall and offset, so that every flip
+    # and translation of it is distinguishable from the original.
+    image = np.zeros((height, width), dtype=np.float32)
+    image[row : row + 12, column : column + 30] = 1.0
+    image[row : row + 4, column : column + 6] = 0.4
+    return image
+
+
+def test_estimate_translation_recovers_a_known_shift():
+    reference = _blob()
+    # The masked correlation only considers shifts leaving 90% of the two masks
+    # overlapping, so it is built for jitter rather than for large displacements.
+    moving = np.roll(reference, (2, -3), axis=(0, 1))
+
+    shift, dissimilarity = sm.estimate_translation(reference, moving)
+
+    assert tuple(shift) == (-2, 3)
+    assert dissimilarity == pytest.approx(0.0, abs=1e-3)
