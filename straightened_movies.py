@@ -730,15 +730,19 @@ def build_movie(
 # Quality-control label marking an image as a usable worm.
 DEFAULT_QC_VALUE = "worm"
 # Columns of the orientation cache, in order.
-ORIENTATION_COLUMNS = [
-    "Time",
-    "Point",
-    "head",
-    "vulva",
-    "head_confidence",
-    "shift_ax0",
-    "shift_ax1",
-]
+# Columns of the orientation cache, with the dtypes they are built with. Stated
+# explicitly so that a run where every point failed still produces a typed frame
+# rather than an all-null one that fails to join.
+ORIENTATION_SCHEMA = {
+    "Time": pl.Int64,
+    "Point": pl.Int64,
+    "head": pl.String,
+    "vulva": pl.String,
+    "head_confidence": pl.Float64,
+    "shift_ax0": pl.Int64,
+    "shift_ax1": pl.Int64,
+}
+ORIENTATION_COLUMNS = list(ORIENTATION_SCHEMA)
 
 
 def load_filemap(path: str) -> pl.DataFrame:
@@ -1098,8 +1102,15 @@ def main() -> None:
         )
         predicted = pl.DataFrame(
             [record for point_records in records for record in point_records],
-            schema=ORIENTATION_COLUMNS,
+            schema=ORIENTATION_SCHEMA,
         )
+        if predicted.height == 0 and cached is None:
+            raise ValueError(
+                "No orientations could be predicted for any of the "
+                f"{len(missing)} points. The errors above say why for each one; "
+                "unreadable images and a mismatched --orientation_channel are the "
+                "usual causes."
+            )
         cached = (
             predicted
             if cached is None

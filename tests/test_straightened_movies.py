@@ -618,3 +618,20 @@ def test_end_to_end_reuses_the_cache_on_a_second_run(synthetic_experiment):
     assert "Predicting orientations" not in result.stdout
     left = tifffile.imread(str(movies / "Point0001_movie.tiff"))
     assert left.shape != centered.shape or not np.array_equal(left, centered)
+
+
+def test_end_to_end_reports_a_clear_error_when_no_point_can_be_predicted(
+    synthetic_experiment,
+):
+    # Corrupt every straightened image so that prediction fails for both points.
+    for path in (
+        synthetic_experiment["experiment"] / "analysis" / "ch1_raw_str"
+    ).iterdir():
+        path.write_bytes(b"not a tiff")
+
+    result = _run_script(synthetic_experiment)
+
+    assert result.returncode != 0
+    assert "No orientations could be predicted" in result.stdout + result.stderr
+    # Not a polars schema error leaking out of an empty frame.
+    assert "SchemaError" not in result.stdout + result.stderr
