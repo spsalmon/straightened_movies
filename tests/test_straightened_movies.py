@@ -255,3 +255,89 @@ def test_estimate_flip_transform_prefers_the_identity_for_an_unflipped_image():
     transform, _, _ = sm.estimate_flip_transform(reference, moving)
 
     assert transform == sm.FlipTransform()
+
+
+# ---- Orientation estimation ----
+
+
+def _worm(length, height=24, flip=None):
+    # A straightened-worm proxy: a bright "pharynx" near the head end and a dimmer
+    # body, so that head and tail are distinguishable and the image is asymmetric
+    # along both axes.
+    image = np.zeros((height, length), dtype=np.float32)
+    image[6:18, :] = 0.3
+    image[6:18, : length // 5] = 1.0
+    image[6:10, length // 3 : length // 2] = 0.7
+    if flip is not None:
+        image = np.flip(image, axis=flip)
+    return image
+
+
+def test_closest_shape_match_picks_the_nearest_reference():
+    references = [np.zeros((10, 10)), np.zeros((10, 40)), np.zeros((10, 100))]
+
+    match = sm.closest_shape_match(np.zeros((10, 45)), references)
+
+    assert match.shape == (10, 40)
+
+
+def test_mean_registered_image_averages_onto_a_common_frame():
+    images = [np.ones((4, 6), dtype=np.float32)] * 3
+    shifts = np.zeros((3, 2), dtype=int)
+
+    mean = sm.mean_registered_image(images, shifts)
+
+    # Centring keeps the registration origin in the middle, so the canvas is
+    # symmetric and the frames land on top of one another.
+    assert mean.shape[0] % 2 == 0 and mean.shape[1] % 2 == 0
+    assert mean.max() == pytest.approx(1.0)
+
+
+def test_running_mean_orientation_flips_a_series_into_agreement():
+    lengths = [40, 44, 48, 52, 56, 60, 64, 68]
+    images = [_worm(length) for length in lengths]
+    # Flip half the series along the length axis; the running mean should undo it.
+    images[4:] = [np.flip(image, axis=1) for image in images[4:]]
+
+    oriented, transforms, shifts = sm.running_mean_orientation(images, window=3)
+
+    assert len(oriented) == len(transforms) == len(images)
+    assert shifts.shape == (len(images), 2)
+    # Whatever absolute direction it settles on, the series must be self-consistent:
+    # the bright pharynx ends up on the same side in every frame.
+    sides = [
+        image[:, : image.shape[1] // 2].sum() > image[:, image.shape[1] // 2 :].sum()
+        for image in oriented
+    ]
+    assert len(set(sides)) == 1
+
+
+def test_align_to_atlas_reports_the_flip_and_full_agreement():
+    atlas = [_worm(length) for length in (40, 50, 60, 70)]
+    images = [np.flip(_worm(length), axis=1) for length in (42, 52, 62)]
+
+    transform, confidence = sm.align_to_atlas(images, atlas)
+
+    assert transform == sm.FlipTransform((1,))
+    assert confidence == pytest.approx(1.0)
+
+
+def test_predict_orientations_labels_a_flipped_series():
+    atlas = [_worm(length) for length in (40, 50, 60, 70)]
+    images = [np.flip(_worm(length), axis=1) for length in (42, 46, 50, 54, 58)]
+
+    shifts, orientations, confidence = sm.predict_orientations(images, atlas)
+
+    assert shifts.shape == (len(images), 2)
+    assert all(orientation["head"] == "R" for orientation in orientations)
+    assert confidence == pytest.approx(1.0)
+
+
+def test_predict_orientations_labels_an_unflipped_series():
+    atlas = [_worm(length) for length in (40, 50, 60, 70)]
+    images = [_worm(length) for length in (42, 46, 50, 54, 58)]
+
+    _, orientations, confidence = sm.predict_orientations(images, atlas)
+
+    assert all(orientation["head"] == "L" for orientation in orientations)
+    assert confidence == pytest.approx(1.0)

@@ -409,3 +409,231 @@ def estimate_flip_transform(
     if scale is not None and scale < 1:
         shift = np.round(shift / scale).astype(int)
     return candidates[best], shift, errors[best]
+
+
+# ---------------------------------------------------------------------------
+# Orientation estimation
+# ---------------------------------------------------------------------------
+
+# Number of previous frames averaged into the reference each image is oriented
+# against. A running mean is steadier than the previous frame alone, which lets a
+# single bad frame flip the rest of the series.
+RUNNING_MEAN_WINDOW = 5
+# Images larger than this are rescaled before the flip search. Registration is
+# quadratic in image size and loses very little accuracy at this resolution.
+MAX_REGISTRATION_PIXELS = 40_000
+# How many frames of a series are compared against the atlas to decide its
+# absolute orientation.
+ATLAS_QUERIES = 50
+
+
+def _registration_scale(image: np.ndarray) -> float:
+    if image.size < MAX_REGISTRATION_PIXELS:
+        return 1.0
+    # The scale applies to axis lengths, so size scales with scale ** ndim.
+    return (MAX_REGISTRATION_PIXELS / image.size) ** (1 / image.ndim)
+
+
+def mean_registered_image(
+    images: list[np.ndarray],
+    shifts: np.ndarray,
+) -> np.ndarray:
+    """
+    Average a set of registered images onto a common frame.
+
+    The canvas is centred on the registration origin rather than cropped to the
+    images, because the result is measured again by phase cross correlation, which
+    reports shifts relative to image centres.
+
+    Parameters:
+        images (list[np.ndarray]): Images of shape ``(H, W)``, of any sizes.
+        shifts (np.ndarray): Registration shift of each image, of shape ``(N, 2)``.
+
+    Returns:
+        np.ndarray: The mean image.
+    """
+    shapes = np.array([image.shape[-2:] for image in images])
+    origins, canvas = registration_origins(shapes, shifts, center=True)
+    stack = assemble_registered_stack(
+        [image.astype(np.float32) for image in images], origins, canvas
+    )
+    return stack.mean(axis=0)
+
+
+def closest_shape_match(
+    image: np.ndarray,
+    references: list[np.ndarray],
+) -> np.ndarray:
+    """
+    Pick the reference whose shape is closest to an image's.
+
+    Straightened worms grow along their length, so shape stands in for
+    developmental stage and keeps the atlas comparison between worms of a similar
+    size.
+
+    Parameters:
+        image (np.ndarray): The image to match.
+        references (list[np.ndarray]): The images to choose from.
+
+    Returns:
+        np.ndarray: The closest reference.
+    """
+    distances = np.abs(
+        np.array([reference.shape for reference in references]) - np.array(image.shape)
+    ).sum(axis=1)
+    return references[int(np.argmin(distances))]
+
+
+def _bootstrap_mean_image(
+    images: list[np.ndarray],
+    channel_axis: int | None = None,
+) -> np.ndarray:
+    # Seeds the running mean: the first few frames have nothing before them, so
+    # they are oriented against each other pairwise instead.
+    if len(images) == 1:
+        return images[0].astype(np.float32)
+
+    transforms = [FlipTransform()]
+    shifts = [np.zeros(2, dtype=int)]
+    for reference, moving in zip(images[:-1], images[1:]):
+        scale = min(_registration_scale(reference), _registration_scale(moving))
+        transform, shift, _ = estimate_flip_transform(
+            reference, moving, channel_axis=channel_axis, scale=scale
+        )
+        # The shift was measured in the previous frame's orientation, so any axis
+        # already mirrored by the running transform reverses its sign.
+        shift = np.array(
+            [
+                -value if axis in transforms[-1] else value
+                for axis, value in enumerate(shift)
+            ]
+        )
+        transforms.append(transforms[-1] + transform)
+        shifts.append(shifts[-1] + shift)
+
+    oriented = [transform(image) for transform, image in zip(transforms, images)]
+    return mean_registered_image(oriented, np.array(shifts))
+
+
+def running_mean_orientation(
+    images: list[np.ndarray],
+    window: int = RUNNING_MEAN_WINDOW,
+    channel_axis: int | None = None,
+) -> tuple[list[np.ndarray], list["FlipTransform"], np.ndarray]:
+    """
+    Orient a series of images so that every frame faces the same way as the others.
+
+    Each image is compared against the mean of the frames already oriented before it.
+    The absolute direction the series settles on is arbitrary at this stage; only
+    agreement within the series is established.
+
+    Parameters:
+        images (list[np.ndarray]): The series, in time order.
+        window (int): Number of previous frames averaged into the reference.
+            (default: RUNNING_MEAN_WINDOW)
+        channel_axis (int | None): Axis holding channels, left unmirrored.
+            (default: None)
+
+    Returns:
+        tuple[list[np.ndarray], list[FlipTransform], np.ndarray]: The oriented
+            images, the transform applied to each, and the cumulative shifts of
+            shape ``(N, 2)``.
+    """
+    seed = _bootstrap_mean_image(images[:window], channel_axis=channel_axis)
+
+    transforms: list[FlipTransform] = []
+    oriented = [seed] * window
+    shifts = [np.zeros(2, dtype=int)] * window
+    for image in images:
+        reference = mean_registered_image(oriented[-window:], np.array(shifts[-window:]))
+        scale = min(_registration_scale(reference), _registration_scale(image))
+        transform, shift, _ = estimate_flip_transform(
+            reference, image, channel_axis=channel_axis, scale=scale
+        )
+        transforms.append(transform)
+        oriented.append(transform(image))
+        shifts.append(shift)
+
+    return oriented[window:], transforms, np.array(shifts[window:])
+
+
+def align_to_atlas(
+    images: list[np.ndarray],
+    atlas: list[np.ndarray],
+    n_queries: int = ATLAS_QUERIES,
+) -> tuple["FlipTransform", float]:
+    """
+    Decide which way a self-consistent series faces, by comparison against an atlas.
+
+    Evenly spaced frames are each matched against the atlas image closest to them in
+    shape. The series is then flipped according to whichever way the majority of
+    those matches point along the head-tail axis.
+
+    Parameters:
+        images (list[np.ndarray]): The series, already oriented to agree with itself.
+        atlas (list[np.ndarray]): Manually oriented reference images, head left and
+            vulva up.
+        n_queries (int): Roughly how many frames to compare. (default: ATLAS_QUERIES)
+
+    Returns:
+        tuple[FlipTransform, float]: The transform bringing the series into the
+            atlas' orientation, and the proportion of queries that agreed on the
+            head-tail direction.
+    """
+    queries = images[:: max(len(images) // n_queries, 1)]
+
+    tally: dict[FlipTransform, int] = {}
+    for query in queries:
+        reference = closest_shape_match(query, atlas)
+        scale = min(_registration_scale(reference), _registration_scale(query))
+        transform, _, _ = estimate_flip_transform(reference, query, scale=scale)
+        tally[transform] = tally.get(transform, 0) + 1
+
+    length_axis = images[0].ndim - 1
+    flipped = {
+        transform: count
+        for transform, count in tally.items()
+        if length_axis in transform
+    }
+    kept = {
+        transform: count
+        for transform, count in tally.items()
+        if length_axis not in transform
+    }
+    majority = flipped if sum(flipped.values()) > sum(kept.values()) else kept
+    confidence = sum(majority.values()) / sum(tally.values())
+    return max(majority, key=majority.get), confidence
+
+
+def predict_orientations(
+    images: list[np.ndarray],
+    atlas: list[np.ndarray],
+) -> tuple[np.ndarray, list[dict[str, str]], float]:
+    """
+    Predict the orientation of every image in one point's series.
+
+    Parameters:
+        images (list[np.ndarray]): The straightened images of one point, in time
+            order, as single-channel arrays of shape ``(H, W)``.
+        atlas (list[np.ndarray]): Manually oriented reference images, head left and
+            vulva up.
+
+    Returns:
+        tuple[np.ndarray, list[dict[str, str]], float]: The registration shifts of
+            shape ``(N, 2)``, the ``head`` / ``vulva`` labels of each image, and the
+            proportion of atlas queries that agreed on the head-tail direction.
+    """
+    normalized = normalize_images_to_common_range(images)
+    oriented, transforms, shifts = running_mean_orientation(normalized)
+    consensus, confidence = align_to_atlas(oriented, atlas)
+
+    # Flipping the whole series reverses coordinates along the mirrored axes, so
+    # the shifts measured before the flip change sign with them.
+    for axis in range(shifts.shape[-1]):
+        if axis in consensus:
+            shifts[:, axis] *= -1
+
+    orientations = [
+        (transform + consensus).orientation_labels() for transform in transforms
+    ]
+    return shifts, orientations, confidence
