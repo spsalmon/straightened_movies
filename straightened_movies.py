@@ -10,10 +10,14 @@ the orientation table under ``--orientations``, the latter purely as a cache tha
 makes re-runs over the same experiment cheap.
 """
 
+from itertools import compress
+from itertools import product
+
 import numpy as np
 from skimage import exposure
 from skimage import metrics
 from skimage import registration
+from skimage import transform as sk_transform
 from towbintools.foundation.image_handling import pad_to_dim_equally
 
 # ---------------------------------------------------------------------------
@@ -276,3 +280,132 @@ def estimate_translation(
         crop_to_mask(moving_padded, overlap),
     )
     return shift, dissimilarity
+
+
+class FlipTransform:
+    """
+    A combination of axis mirrorings, composable with other flips.
+
+    Orientations are expressed relative to the atlas convention of head left and
+    vulva up: a transform that mirrors the last axis is the one that turns a
+    head-right worm into a head-left one, and therefore also the one that reports
+    the original as head-right.
+    """
+
+    def __init__(self, mirror_axes: tuple[int, ...] | None = None):
+        # A frozenset so that transforms can be dictionary keys when tallying the
+        # atlas consensus.
+        self.mirror_axes = frozenset(mirror_axes or ())
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        return np.flip(image, axis=tuple(self.mirror_axes))
+
+    def __add__(self, other: "FlipTransform") -> "FlipTransform":
+        # Flipping the same axis twice is the identity, so composition is the
+        # symmetric difference of the mirrored axes.
+        return FlipTransform(tuple(self.mirror_axes ^ other.mirror_axes))
+
+    def __hash__(self) -> int:
+        return hash(self.mirror_axes)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FlipTransform) and self.mirror_axes == other.mirror_axes
+
+    def __contains__(self, axis: int) -> bool:
+        return axis in self.mirror_axes
+
+    def __repr__(self) -> str:
+        return f"FlipTransform(mirror_axes={tuple(sorted(self.mirror_axes))})"
+
+    def orientation_labels(self) -> dict[str, str]:
+        """
+        Report the orientation of the image this transform aligns to the atlas.
+
+        Returns:
+            dict[str, str]: ``"head"`` as ``"L"`` or ``"R"`` and ``"vulva"`` as
+                ``"U"`` or ``"D"``.
+        """
+        return {
+            "head": "R" if 1 in self else "L",
+            "vulva": "D" if 0 in self else "U",
+        }
+
+    @staticmethod
+    def all_transforms(
+        ndim: int, channel_axis: int | None = None
+    ) -> list["FlipTransform"]:
+        """
+        Enumerate every combination of mirrorings over an image's axes.
+
+        Parameters:
+            ndim (int): Number of axes of the images being transformed.
+            channel_axis (int | None): Axis to leave alone, or ``None`` to mirror
+                every axis. (default: None)
+
+        Returns:
+            list[FlipTransform]: The ``2 ** n`` transforms over the mirrored axes.
+        """
+        axes = list(range(ndim))
+        if channel_axis is not None:
+            axes.pop(channel_axis)
+        return [
+            FlipTransform(tuple(compress(axes, included)))
+            for included in product((False, True), repeat=len(axes))
+        ]
+
+
+def estimate_flip_transform(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    channel_axis: int | None = None,
+    scale: float | None = None,
+) -> tuple["FlipTransform", np.ndarray, float]:
+    """
+    Find the mirroring that best aligns one image onto another.
+
+    Every combination of mirrorings is registered onto the reference by phase cross
+    correlation, and scored by how dissimilar the registered pair is plus a penalty
+    on how far the image had to move. The penalty ignores the movement needed to
+    account for the two images simply being different sizes, so that a large but
+    necessary shift is not mistaken for a poor match.
+
+    Parameters:
+        reference (np.ndarray): The image being aligned onto.
+        moving (np.ndarray): The image being mirrored and moved.
+        channel_axis (int | None): Axis holding channels, left unmirrored.
+            (default: None)
+        scale (float | None): Factor below 1 to rescale both images by before
+            searching, trading a little accuracy for speed on large images. The
+            returned shift is expressed at the original scale. (default: None)
+
+    Returns:
+        tuple[FlipTransform, np.ndarray, float]: The best transform, the integer
+            shift registering the mirrored image onto the reference, and the score.
+    """
+    if scale is not None and scale < 1:
+        reference = sk_transform.rescale(
+            reference, scale, anti_aliasing=True, channel_axis=channel_axis
+        )
+        moving = sk_transform.rescale(
+            moving, scale, anti_aliasing=True, channel_axis=channel_axis
+        )
+
+    size_mismatch = np.round(
+        np.abs(np.array(reference.shape) - np.array(moving.shape)) / 2
+    )
+    largest_axis = np.max(np.vstack([reference.shape, moving.shape]), axis=0).max()
+
+    candidates = FlipTransform.all_transforms(reference.ndim, channel_axis=channel_axis)
+    shifts = []
+    errors = []
+    for candidate in candidates:
+        shift, dissimilarity = estimate_translation(reference, candidate(moving))
+        movement = np.clip(np.abs(shift) - size_mismatch, 0, None)
+        errors.append(dissimilarity + (movement / largest_axis).sum() * 2)
+        shifts.append(shift)
+
+    best = int(np.argmin(errors))
+    shift = shifts[best]
+    if scale is not None and scale < 1:
+        shift = np.round(shift / scale).astype(int)
+    return candidates[best], shift, errors[best]

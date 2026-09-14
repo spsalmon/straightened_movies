@@ -196,3 +196,62 @@ def test_estimate_translation_recovers_a_known_shift():
 
     assert tuple(shift) == (-2, 3)
     assert dissimilarity == pytest.approx(0.0, abs=1e-3)
+
+
+# ---- Flip transforms ----
+
+
+def test_flip_transform_composition_is_symmetric_difference():
+    flip_rows = sm.FlipTransform((0,))
+    flip_both = sm.FlipTransform((0, 1))
+
+    assert flip_rows + flip_both == sm.FlipTransform((1,))
+    # A flip is its own inverse.
+    assert flip_rows + flip_rows == sm.FlipTransform()
+
+
+def test_flip_transform_is_hashable_and_compares_by_axes():
+    assert sm.FlipTransform((0, 1)) == sm.FlipTransform((1, 0))
+    assert len({sm.FlipTransform((0, 1)), sm.FlipTransform((1, 0))}) == 1
+
+
+def test_flip_transform_orientation_labels():
+    # Head left and vulva up is the atlas convention, so an identity transform
+    # reports the worm as already facing that way.
+    assert sm.FlipTransform().orientation_labels() == {"head": "L", "vulva": "U"}
+    assert sm.FlipTransform((1,)).orientation_labels() == {"head": "R", "vulva": "U"}
+    assert sm.FlipTransform((0,)).orientation_labels() == {"head": "L", "vulva": "D"}
+    assert sm.FlipTransform((0, 1)).orientation_labels() == {"head": "R", "vulva": "D"}
+
+
+def test_flip_transform_applies_the_flip():
+    image = np.array([[1, 2], [3, 4]])
+
+    assert np.array_equal(sm.FlipTransform((1,))(image), np.array([[2, 1], [4, 3]]))
+    assert np.array_equal(sm.FlipTransform()(image), image)
+
+
+def test_all_transforms_enumerates_every_combination():
+    assert len(sm.FlipTransform.all_transforms(2)) == 4
+    assert len(sm.FlipTransform.all_transforms(3)) == 8
+    assert len(sm.FlipTransform.all_transforms(3, channel_axis=0)) == 4
+
+
+def test_estimate_flip_transform_recovers_a_flip():
+    reference = _blob()
+    moving = np.flip(reference, axis=1)
+
+    transform, shift, error = sm.estimate_flip_transform(reference, moving)
+
+    assert transform == sm.FlipTransform((1,))
+    assert error == pytest.approx(0.0, abs=1e-3)
+    assert np.array_equal(shift, np.zeros(2, dtype=int))
+
+
+def test_estimate_flip_transform_prefers_the_identity_for_an_unflipped_image():
+    reference = _blob()
+    moving = np.roll(reference, 3, axis=1)
+
+    transform, _, _ = sm.estimate_flip_transform(reference, moving)
+
+    assert transform == sm.FlipTransform()
