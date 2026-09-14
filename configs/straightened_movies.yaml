@@ -1,0 +1,31 @@
+# Example: straightened movies as a pipeline custom block. The block writes movies
+# and an orientation cache; it adds nothing to the experiment filemap, which is what
+# custom_script_return_type: null means. That return type needs the pipeline patch
+# from this rewrite (see docs/superpowers/specs/).
+experiment_dir: "/mnt/towbin.data/shared/USER/EXPERIMENT"
+analysis_dir_name: "analysis"
+raw_dir_name: "raw"
+report_format: "csv"
+pixelsize: [0.65]
+get_experiment_time: True
+
+sbatch_memory: 64G
+sbatch_time: 0-12:00:00
+sbatch_cpus: 32
+
+building_blocks:
+  - "custom"
+
+custom_script_path: ["/home/spsalmon/straightened_movies/straightened_movies.py"]
+custom_script_name: ["straightened_movies"]
+custom_script_return_type: [null]
+custom_script_parameters:
+  - [
+      "--straightened_column analysis/ch1_ch2_raw_str",
+      "--orientation_channel 1",
+      "--qc_column ch2_seg_str_qc",
+      "--atlas /mnt/towbin.data/shared/bgusev/atlas/dark_germline/atlas.csv",
+      "--atlas_channel 1",
+      "--movie_columns All",
+      "--alignment left",
+    ]
