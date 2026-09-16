@@ -764,9 +764,10 @@ def build_movie(
     """
     Assemble registered frames into a movie.
 
-    The frames are placed on a shared canvas by their registration shifts, which
-    removes the jitter between consecutive timepoints, and anchored according to
-    ``alignment``. Frames must already face head left and vulva up.
+    The frames are placed on a shared canvas by their head-tail registration
+    shifts, which removes the jitter between consecutive timepoints, and anchored
+    according to ``alignment``. Dorsoventrally they are centred, which keeps the
+    midline on one row. Frames must already face head left and vulva up.
 
     Parameters:
         images (list[np.ndarray]): Frames of shape ``(C, H, W)`` or ``(H, W)``, in
@@ -788,6 +789,11 @@ def build_movie(
         )
     frames = [image[np.newaxis, ...] if image.ndim == 2 else image for image in images]
     shapes = np.array([frame.shape[-2:] for frame in frames])
+    # Straightening already puts the midline on the centre row of every frame, so
+    # centring is the dorsoventral registration. The measured shift on that axis
+    # only adds rounding noise and drift accumulated through the running mean.
+    shifts = np.array(shifts, dtype=int)
+    shifts[:, 0] = 0
     origins, canvas = registration_origins(
         shapes, shifts, anchors=ALIGNMENTS[alignment]
     )

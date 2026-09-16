@@ -101,8 +101,13 @@ head-tail axis:
   directions. This is the historical behaviour.
 - **`left`** anchors the head end, so growth runs left to right.
 
-The dorsoventral axis stays centred either way, and **the choice does not affect
-the registration**. Alignment only moves every frame by a common offset; the
+The dorsoventral axis is centred either way, and the registration shift on that
+axis (`shift_ax0`) is not applied. Straightening already puts the midline on the
+centre row of every frame (the segmentation's centre sits within 0.3 px of it on
+real data), whereas the measured shift wandered by tens of pixels over a movie and
+by about a pixel between frames, which showed as wobble and drift.
+
+The choice of alignment **does not affect the registration**. Alignment only moves every frame by a common offset; the
 spacing between frames, which is what removes the jitter, is the difference in
 their registration shifts under either anchor. So the same orientation cache
 serves both, and switching alignment only re-assembles the movies.

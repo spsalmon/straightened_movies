@@ -438,6 +438,20 @@ def test_build_movie_preserves_registration_under_both_alignments():
     assert np.array_equal(np.diff(starts(left)), np.diff(shifts[:, 1]))
 
 
+def test_build_movie_centres_every_frame_dorsoventrally():
+    # Straightening puts the midline on the centre row of every frame, so a
+    # registered dorsoventral shift can only move the worm off it.
+    images = [np.ones((height, 20), dtype=np.uint16) for height in (10, 12, 11, 14)]
+    shifts = np.array([[0, 0], [5, 0], [-3, 0], [9, 0]])
+
+    movie = sm.build_movie(images, shifts, alignment="center")
+
+    centres = [
+        np.flatnonzero(frame[0].any(axis=1)).mean() for frame in movie
+    ]
+    assert max(centres) - min(centres) <= 0.5
+
+
 def test_build_movie_promotes_single_channel_frames():
     movie = sm.build_movie(_growing_series([10, 12]), np.zeros((2, 2), dtype=int))
 

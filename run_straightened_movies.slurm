@@ -20,13 +20,13 @@ ANALYSIS_DIR="analysis_sacha"
 ~/.local/bin/micromamba run -n towbintools python3 \
     "$(dirname "$0")/straightened_movies.py" \
     --filemap "${EXPERIMENT}/${ANALYSIS_DIR}/report/analysis_filemap.csv" \
-    --straightened_column "${ANALYSIS_DIR}/ch1_ch2_raw_str" \
-    --orientation_channel 1 \
+    --straightened_column "${ANALYSIS_DIR}/ch2_raw_str" \
+    --orientation_channel 0 \
     --qc_column "ch2_seg_str_qc" \
     --atlas "/mnt/towbin.data/shared/bgusev/atlas/dark_germline/atlas.csv" \
     --atlas_channel 1 \
-    --movie_columns All \
-    --alignment left \
+    --movie_columns "${ANALYSIS_DIR}/ch2_raw_str" \
+    --alignment center \
     --points 0-3 \
     --n_jobs "${SLURM_CPUS_PER_TASK:-1}"
 
