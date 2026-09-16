@@ -111,19 +111,6 @@ def test_assemble_registered_stack_rejects_mismatched_leading_dimensions():
         sm.assemble_registered_stack(images, np.zeros((2, 2), dtype=int), (2, 2))
 
 
-def test_crop_to_mask_returns_the_bounding_box():
-    image = np.arange(20).reshape(4, 5)
-    mask = np.zeros((4, 5), dtype=bool)
-    mask[1:3, 2:4] = True
-
-    assert np.array_equal(sm.crop_to_mask(image, mask), image[1:3, 2:4])
-
-
-def test_crop_to_mask_rejects_an_empty_mask():
-    with pytest.raises(ValueError, match="empty mask"):
-        sm.crop_to_mask(np.zeros((4, 5)), np.zeros((4, 5), dtype=bool))
-
-
 # ---- Normalisation, similarity, translation ----
 
 
@@ -185,6 +172,36 @@ def _blob(height=60, width=80, row=20, column=10):
     return image
 
 
+@pytest.mark.parametrize(
+    "reference_shape, moving_shape", [((30, 70), (30, 70)), ((25, 80), (32, 61))]
+)
+def test_overlap_normalized_cross_correlation_matches_skimage(
+    reference_shape, moving_shape
+):
+    from skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked,
+    )
+
+    rng = np.random.default_rng(0)
+    reference = rng.random(reference_shape)
+    moving = rng.random(moving_shape)
+
+    correlation = sm.overlap_normalized_cross_correlation(
+        reference, moving, overlap_ratio=0.5
+    )
+    expected = cross_correlate_masked(
+        moving,
+        reference,
+        np.ones_like(moving, dtype=bool),
+        np.ones_like(reference, dtype=bool),
+        axes=(0, 1),
+        overlap_ratio=0.5,
+    )
+
+    # skimage indexes offsets in the opposite direction.
+    np.testing.assert_allclose(correlation, expected[::-1, ::-1], atol=1e-8)
+
+
 def test_estimate_translation_recovers_a_known_shift():
     reference = _blob()
     # The masked correlation only considers shifts leaving 90% of the two masks
@@ -194,6 +211,19 @@ def test_estimate_translation_recovers_a_known_shift():
     shift, dissimilarity = sm.estimate_translation(reference, moving)
 
     assert tuple(shift) == (-2, 3)
+    assert dissimilarity == pytest.approx(0.0, abs=1e-3)
+
+
+def test_estimate_translation_registers_differently_sized_images():
+    texture = np.random.default_rng(0).random((60, 120)).astype(np.float32)
+    reference = texture[2:42, 4:105]
+    moving = texture[5:50, 9:104]
+
+    shift, dissimilarity = sm.estimate_translation(reference, moving)
+
+    # The origins are 3 and 5 pixels apart; the rest is the difference between
+    # the two centres, rounded down.
+    assert tuple(shift) == (3 + 22 - 19, 5 + 47 - 50)
     assert dissimilarity == pytest.approx(0.0, abs=1e-3)
 
 

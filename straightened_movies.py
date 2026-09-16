@@ -22,14 +22,13 @@ import numpy as np
 import polars as pl
 from joblib import Parallel
 from joblib import delayed
+from scipy import signal
 from skimage import exposure
 from skimage import metrics
-from skimage import registration
 from skimage import transform as sk_transform
 from tifffile import imwrite
 from towbintools.foundation.file_handling import read_filemap
 from towbintools.foundation.file_handling import write_filemap
-from towbintools.foundation.image_handling import pad_to_dim_equally
 from towbintools.foundation.image_handling import read_tiff_file
 
 # ---------------------------------------------------------------------------
@@ -134,32 +133,6 @@ def assemble_registered_stack(
     return stack
 
 
-def crop_to_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Crop an image to the bounding box of a boolean mask.
-
-    Parameters:
-        image (np.ndarray): Image of shape ``(..., H, W)``.
-        mask (np.ndarray): Boolean mask of shape ``(H, W)``.
-
-    Returns:
-        np.ndarray: The image cropped to the mask's bounding box.
-
-    Raises:
-        ValueError: If the mask does not match the image's trailing axes, or is empty.
-    """
-    if mask.shape != image.shape[-2:]:
-        raise ValueError(
-            f"Mask shape {mask.shape} does not match the image's trailing axes "
-            f"{image.shape[-2:]}"
-        )
-    rows = np.flatnonzero(mask.any(axis=1))
-    columns = np.flatnonzero(mask.any(axis=0))
-    if rows.size == 0 or columns.size == 0:
-        raise ValueError("Cannot crop to an empty mask")
-    return image[..., rows[0] : rows[-1] + 1, columns[0] : columns[-1] + 1]
-
-
 def normalize_images_to_common_range(
     images: list[np.ndarray],
     out_range: str = "float32",
@@ -247,6 +220,78 @@ def structural_dissimilarity(
     return 1 - similarity
 
 
+def _box_sums(image: np.ndarray, box_shape: tuple[int, ...]) -> np.ndarray:
+    # Sum of the image under a box at every offset where the two overlap, as in a
+    # "full" correlation, from running sums along one axis at a time.
+    for axis, size in enumerate(box_shape):
+        length = image.shape[axis]
+        padding = [(0, 0)] * image.ndim
+        padding[axis] = (1, 0)
+        running = np.pad(image.cumsum(axis=axis), padding)
+        ends = np.arange(1, length + size)
+        image = np.take(running, np.minimum(ends, length), axis=axis) - np.take(
+            running, np.maximum(ends - size, 0), axis=axis
+        )
+    return image
+
+
+def overlap_normalized_cross_correlation(
+    reference: np.ndarray,
+    moving: np.ndarray,
+    overlap_ratio: float = 0.3,
+) -> np.ndarray:
+    """
+    Normalised cross correlation of two images over their overlap, at every offset.
+
+    Equivalent to scikit-image's masked cross correlation with masks covering both
+    images entirely. Every overlap is then a rectangle, so the sums over it come
+    from running sums, and a single plain cross correlation is left to compute by
+    FFT instead of the six an arbitrary mask needs.
+
+    Parameters:
+        reference (np.ndarray): Image of shape ``(H, W)``.
+        moving (np.ndarray): Image of shape ``(h, w)``.
+        overlap_ratio (float): Offsets overlapping on fewer pixels than this
+            fraction of the largest overlap are scored zero. (default: 0.3)
+
+    Returns:
+        np.ndarray: The correlation, of shape ``(H + h - 1, W + w - 1)``. Entry
+            ``(i, j)`` scores the offset placing pixel ``(0, 0)`` of ``moving`` on
+            pixel ``(i - h + 1, j - w + 1)`` of ``reference``.
+    """
+    reference = reference.astype(np.float64)
+    # Flipped, the moving image's overlap sums line up with the reference's.
+    flipped = moving[::-1, ::-1].astype(np.float64)
+
+    pixels = np.outer(
+        *(
+            np.convolve(np.ones(reference_size), np.ones(moving_size))
+            for reference_size, moving_size in zip(reference.shape, moving.shape)
+        )
+    )
+    reference_sum = _box_sums(reference, moving.shape)
+    moving_sum = _box_sums(flipped, reference.shape)
+
+    # Each term is the (co)variance over the overlap times its pixel count, which
+    # cancels out of the ratio.
+    covariance = (
+        signal.fftconvolve(reference, flipped) - reference_sum * moving_sum / pixels
+    )
+    reference_variance = (
+        _box_sums(reference**2, moving.shape) - reference_sum**2 / pixels
+    )
+    moving_variance = _box_sums(flipped**2, reference.shape) - moving_sum**2 / pixels
+    denominator = np.sqrt(
+        np.clip(reference_variance, 0, None) * np.clip(moving_variance, 0, None)
+    )
+
+    correlation = np.zeros_like(denominator)
+    valid = denominator > 1e3 * np.finfo(denominator.dtype).eps * denominator.max()
+    correlation[valid] = np.clip(covariance[valid] / denominator[valid], -1, 1)
+    correlation[pixels < overlap_ratio * pixels.max()] = 0
+    return correlation
+
+
 def estimate_translation(
     reference: np.ndarray,
     moving: np.ndarray,
@@ -254,44 +299,41 @@ def estimate_translation(
     """
     Find the translation that best registers one image onto another.
 
-    Both images are padded to the sum of their shapes so that the circular
-    convolution behind phase cross correlation cannot wrap one edge onto the other,
-    and the dissimilarity is measured over the region where they actually overlap.
+    Every offset is scored by normalised cross correlation over the overlap of the
+    two images alone, so neither edge can wrap onto the other, and the
+    dissimilarity is measured over that same overlap once registered.
 
     Parameters:
         reference (np.ndarray): The image being registered onto, of shape ``(H, W)``.
-        moving (np.ndarray): The image being moved, of shape ``(H, W)``.
+        moving (np.ndarray): The image being moved, of shape ``(h, w)``.
 
     Returns:
         tuple[np.ndarray, float]: The integer shift applying ``moving`` onto
-            ``reference``, and the dissimilarity of the two once registered.
+            ``reference``, with both images centred on a common canvas, and the
+            dissimilarity of the two once registered.
     """
-    target = np.array(reference.shape) + np.array(moving.shape) - 1
-    reference_padded = pad_to_dim_equally(reference, *target)
-    reference_mask = pad_to_dim_equally(np.ones_like(reference, dtype=bool), *target)
-    moving_padded = pad_to_dim_equally(moving, *target)
-    moving_mask = pad_to_dim_equally(np.ones_like(moving, dtype=bool), *target)
-
-    # The masked variant always returns an integer shift, but types it as a float.
-    shift, _, _ = registration.phase_cross_correlation(
-        reference_image=reference_padded,
-        reference_mask=reference_mask,
-        moving_image=moving_padded,
-        moving_mask=moving_mask,
-        overlap_ratio=0.9,
-        normalization=None,
+    reference_shape = np.array(reference.shape)
+    moving_shape = np.array(moving.shape)
+    correlation = overlap_normalized_cross_correlation(
+        reference, moving, overlap_ratio=0.9
     )
-    shift = shift.astype(int)
+    # Equal maxima are averaged, as in skimage's masked registration.
+    peak = np.argwhere(correlation == correlation.max()).mean(axis=0)
+    offset = np.rint(peak - moving_shape + 1).astype(int)
 
-    moving_padded = np.roll(moving_padded, shift, axis=(-2, -1))
-    moving_mask = np.roll(moving_mask, shift, axis=(-2, -1))
-
-    overlap = reference_mask & moving_mask
+    start = np.maximum(offset, 0)
+    stop = np.minimum(reference_shape, moving_shape + offset)
     dissimilarity = structural_dissimilarity(
-        crop_to_mask(reference_padded, overlap),
-        crop_to_mask(moving_padded, overlap),
+        reference[start[0] : stop[0], start[1] : stop[1]],
+        moving[
+            start[0] - offset[0] : stop[0] - offset[0],
+            start[1] - offset[1] : stop[1] - offset[1],
+        ],
     )
-    return shift, dissimilarity
+
+    # Centring rounds down, as padding each image evenly to a common size does.
+    centring = (moving_shape - 1) // 2 - (reference_shape - 1) // 2
+    return offset + centring, dissimilarity
 
 
 class FlipTransform:
