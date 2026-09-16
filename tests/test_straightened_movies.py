@@ -501,6 +501,39 @@ def test_read_straightened_image_returns_none_for_an_unreadable_file(tmp_path):
     assert sm.read_straightened_image(str(broken), 0) is None
 
 
+def test_dimension_outliers_flags_isolated_size_jumps_but_not_growth():
+    lengths = np.arange(300, 600, 20)
+    shapes = np.stack([np.full_like(lengths, 40), lengths], axis=1)
+    shapes[4] = (130, shapes[4, 1])
+    shapes[9] = (40, shapes[9, 1] // 3)
+
+    outliers = sm.dimension_outliers(shapes)
+
+    assert np.flatnonzero(outliers).tolist() == [4, 9]
+
+
+def test_read_straightened_image_returns_none_for_a_blank_placeholder(tmp_path):
+    import tifffile
+
+    # What a failed straightening leaves behind: one blank plane, whatever channel
+    # was asked for.
+    placeholder = tmp_path / "placeholder.tiff"
+    tifffile.imwrite(placeholder, np.zeros((64, 64), dtype=np.uint8))
+
+    assert sm.read_straightened_image(str(placeholder), 1) is None
+
+
+def test_read_straightened_image_keeps_a_worm(tmp_path):
+    import tifffile
+
+    worm = np.zeros((2, 10, 40), dtype=np.uint16)
+    worm[1, 3:7, 5:35] = 100
+    path = tmp_path / "worm.tiff"
+    tifffile.imwrite(path, worm)
+
+    assert np.array_equal(sm.read_straightened_image(str(path), 1), worm[1])
+
+
 @pytest.fixture
 def synthetic_experiment(tmp_path):
     """A tiny two-point experiment: filemap, straightened images, and an atlas."""

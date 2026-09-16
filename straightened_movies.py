@@ -22,6 +22,7 @@ import numpy as np
 import polars as pl
 from joblib import Parallel
 from joblib import delayed
+from scipy import ndimage
 from scipy import signal
 from skimage import exposure
 from skimage import metrics
@@ -218,6 +219,34 @@ def structural_dissimilarity(
         use_sample_covariance=False,
     )
     return 1 - similarity
+
+
+def dimension_outliers(
+    shapes: np.ndarray,
+    window: int = 11,
+    tolerance: float = 2.0,
+) -> np.ndarray:
+    """
+    Flag frames of a time series whose size departs sharply from their neighbours'.
+
+    Each dimension of each frame is compared against its median over the
+    surrounding frames, which follows steady growth while ignoring isolated
+    outliers.
+
+    Parameters:
+        shapes (np.ndarray): Size of each frame, of shape ``(N, D)``, in time order.
+        window (int): Number of frames the median is taken over, centred on each
+            frame. (default: 11)
+        tolerance (float): Factor by which a dimension may differ from its median,
+            in either direction. (default: 2.0)
+
+    Returns:
+        np.ndarray: Boolean array of shape ``(N,)``, ``True`` for outlying frames.
+    """
+    shapes = np.asarray(shapes, dtype=float)
+    medians = ndimage.median_filter(shapes, size=(window, 1), mode="nearest")
+    ratios = shapes / medians
+    return ((ratios > tolerance) | (ratios < 1 / tolerance)).any(axis=1)
 
 
 def _box_sums(image: np.ndarray, box_shape: tuple[int, ...]) -> np.ndarray:
@@ -819,13 +848,30 @@ def load_config(path: str | None) -> dict:
         return yaml.safe_load(handle)
 
 
+def is_blank_image(image: np.ndarray) -> bool:
+    """
+    Tell whether an image holds a single value throughout.
+
+    When straightening fails, a blank single-plane image the size of the raw field
+    of view is written in place of the worm. Such frames can still pass quality
+    control, and no real straightened worm is uniform.
+
+    Parameters:
+        image (np.ndarray): The image to check.
+
+    Returns:
+        bool: ``True`` if every pixel has the same value.
+    """
+    return image.min() == image.max()
+
+
 def read_straightened_image(path: str, channel: int) -> np.ndarray | None:
     """
-    Read one channel of a straightened image, or ``None`` if it cannot be read.
+    Read one channel of a straightened image, or ``None`` if it is unusable.
 
-    A small fraction of straightened images are written out malformed, and asking
-    for a channel they do not have raises. Returning ``None`` lets the caller drop
-    that frame instead of losing the whole point to it.
+    A small fraction of straightened images are written out malformed or blank.
+    Returning ``None`` lets the caller drop that frame instead of losing the whole
+    point to it.
 
     Parameters:
         path (str): Path to the image.
@@ -841,6 +887,8 @@ def read_straightened_image(path: str, channel: int) -> np.ndarray | None:
         return None
     if image.ndim != 2:
         print(f"Unexpected shape {image.shape} for channel {channel} of {path}")
+        return None
+    if is_blank_image(image):
         return None
     return image
 
@@ -950,7 +998,7 @@ def predict_point_orientations(
         channel (int): Channel index used to predict orientation.
 
     Returns:
-        list[dict]: One record per readable image, with the orientation-cache
+        list[dict]: One record per usable image, with the orientation-cache
             columns. Empty if the point could not be processed.
     """
     try:
@@ -959,12 +1007,21 @@ def predict_point_orientations(
         if not all(readable):
             print(
                 f"Point {point}: skipped {readable.count(False)}/{len(readable)} "
-                "images that could not be read"
+                "images that were unreadable or blank"
             )
-        times = [t for t, keep in zip(times, readable) if keep]
-        images = [image for image in images if image is not None]
+        times = list(compress(times, readable))
+        images = list(compress(images, readable))
         if not images:
-            raise ValueError(f"No readable images for point {point}")
+            raise ValueError(f"No usable images for point {point}")
+
+        normal = ~dimension_outliers([image.shape for image in images])
+        if not normal.all():
+            print(
+                f"Point {point}: skipped {(~normal).sum()}/{len(normal)} "
+                "images of abnormal dimensions"
+            )
+        times = list(compress(times, normal))
+        images = list(compress(images, normal))
 
         shifts, orientations, confidence = predict_orientations(images, atlas)
 

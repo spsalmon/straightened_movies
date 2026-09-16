@@ -20,7 +20,10 @@ Two stages, one script:
 ## Requirements
 
 - Straightened images, and a quality-control column to filter out eggs and empty
-  frames.
+  frames. Frames that slip through anyway are dropped: blank placeholders left by
+  a failed straightening, and frames more than twice as thick or as long as their
+  neighbours, or less than half. They get no orientation and stay out of the
+  movies.
 - An atlas: 50-100 manually oriented images is plenty. They need to cover the
   full range of morphology across the experiment, i.e. every developmental stage.
   Pre-made atlases live in `/mnt/towbin.data/shared/bgusev/atlas`.
