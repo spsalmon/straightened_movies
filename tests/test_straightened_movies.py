@@ -534,6 +534,20 @@ def test_read_straightened_image_keeps_a_worm(tmp_path):
     assert np.array_equal(sm.read_straightened_image(str(path), 1), worm[1])
 
 
+def test_usable_movie_frames_drops_placeholders_and_odd_frames():
+    worm = np.zeros((2, 10, 40), dtype=np.uint16)
+    worm[1, 3:7, 5:35] = 100
+    # A blank single-plane placeholder, and a two-channel frame of wildly wrong size.
+    placeholder = np.zeros((120, 120), dtype=np.uint16)
+    oversized = np.ones((2, 100, 40), dtype=np.uint16)
+    oversized[1, 0, 0] = 5
+    images = [worm] * 6 + [placeholder] + [worm] * 5 + [oversized] + [worm] * 3
+
+    usable = sm.usable_movie_frames(images)
+
+    assert np.flatnonzero(~usable).tolist() == [6, 12]
+
+
 @pytest.fixture
 def synthetic_experiment(tmp_path):
     """A tiny two-point experiment: filemap, straightened images, and an atlas."""
@@ -698,3 +712,32 @@ def test_end_to_end_reports_a_clear_error_when_no_point_can_be_predicted(
     assert "No orientations could be predicted" in result.stdout + result.stderr
     # Not a polars schema error leaking out of an empty frame.
     assert "SchemaError" not in result.stdout + result.stderr
+
+
+def test_end_to_end_skips_placeholders_listed_in_a_stale_cache(synthetic_experiment):
+    import polars as pl
+    import tifffile
+
+    _run_script(synthetic_experiment)
+
+    # A cache written before placeholders were filtered out still lists them, so
+    # replace one cached frame with the blank single plane a failed straightening
+    # leaves behind.
+    cache = pl.read_csv(str(synthetic_experiment["report"] / "orientations.csv"))
+    time = cache.filter(pl.col("Point") == 1)["Time"][2]
+    placeholder = (
+        synthetic_experiment["experiment"]
+        / "analysis"
+        / "ch1_raw_str"
+        / f"Time{time:06d}_Point000001_str.tiff"
+    )
+    tifffile.imwrite(str(placeholder), np.zeros((200, 200), dtype=np.uint16))
+
+    result = _run_script(synthetic_experiment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Error building" not in result.stdout
+    movies = synthetic_experiment["experiment"] / "movies" / "ch1_raw_str_movies"
+    movie = tifffile.imread(str(movies / "Point0001_movie.tiff"))
+    assert movie.shape[0] == cache.filter(pl.col("Point") == 1).height - 1
+    assert movie.shape[-2] < 200

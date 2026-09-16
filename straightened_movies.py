@@ -1043,6 +1043,35 @@ def predict_point_orientations(
         return []
 
 
+def usable_movie_frames(images: list[np.ndarray]) -> np.ndarray:
+    """
+    Flag the frames of a point that can go into its movie.
+
+    A blank frame is a placeholder left by a failed straightening. A frame with a
+    different number of leading dimensions from most of the others cannot be
+    stacked with them, and a frame of outlying size would widen the whole canvas.
+    Orientation prediction already skips such frames, but an orientation cache
+    written before it did still lists them, so the movie checks again.
+
+    Parameters:
+        images (list[np.ndarray]): The point's frames, in time order.
+
+    Returns:
+        np.ndarray: Boolean array of shape ``(N,)``, ``True`` for usable frames.
+    """
+    usable = np.array([not is_blank_image(image) for image in images], dtype=bool)
+    leading = [image.shape[:-2] for image in images]
+    kept = list(compress(leading, usable))
+    if kept:
+        common = max(set(kept), key=kept.count)
+        usable &= np.array([shape == common for shape in leading], dtype=bool)
+    indices = np.flatnonzero(usable)
+    if indices.size:
+        shapes = [images[index].shape[-2:] for index in indices]
+        usable[indices[dimension_outliers(shapes)]] = False
+    return usable
+
+
 def write_point_movies(
     point: int,
     rows: pl.DataFrame,
@@ -1075,8 +1104,21 @@ def write_point_movies(
         os.makedirs(output_dir, exist_ok=True)
         try:
             images = [read_tiff_file(path) for path in rows[column].to_list()]
+            usable = usable_movie_frames(images)
+            if not usable.all():
+                print(
+                    f"Point {point}: left {(~usable).sum()}/{len(usable)} blank or "
+                    f"malformed frames out of the {column} movie"
+                )
+            if not usable.any():
+                raise ValueError("No usable frames")
             movie = build_movie(
-                orient_images(images, orientations), shifts, alignment=alignment
+                orient_images(
+                    list(compress(images, usable)),
+                    list(compress(orientations, usable)),
+                ),
+                shifts[usable],
+                alignment=alignment,
             )
             imwrite(
                 os.path.join(output_dir, f"Point{point:04}_movie.tiff"),
